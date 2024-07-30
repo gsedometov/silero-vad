@@ -10,16 +10,15 @@ import java.util.List;
 import java.util.Map;
 
 public class SlieroVadOnnxModel {
+    private static final int CONTEXT_SIZE = 32;
     // Define private variable OrtSession
     private final OrtSession session;
-    private float[][][] h;
-    private float[][][] c;
-    // Define the last sample rate
-    private int lastSr = 0;
-    // Define the last batch size
-    private int lastBatchSize = 0;
+    private float[][][] state;
+    private float[][] context;
+    public static final int SR16K = 16000;
+    public static final int SR8K = 8000;
     // Define a list of supported sample rates
-    private static final List<Integer> SAMPLE_RATES = Arrays.asList(8000, 16000);
+    private static final List<Integer> SAMPLE_RATES = Arrays.asList(SR8K, SR16K);
 
     // Constructor
     public SlieroVadOnnxModel(String modelPath) throws OrtException {
@@ -43,28 +42,15 @@ public class SlieroVadOnnxModel {
      * Reset states
      */
     void resetStates() {
-        h = new float[2][1][64];
-        c = new float[2][1][64];
-        lastSr = 0;
-        lastBatchSize = 0;
+        state = new float[2][1][128];
+        context = new float[1][CONTEXT_SIZE];
     }
 
     public void close() throws OrtException {
         session.close();
     }
 
-    /**
-     * Define inner class ValidationResult
-     */
-    public static class ValidationResult {
-        public final float[][] x;
-        public final int sr;
-
-        // Constructor
-        public ValidationResult(float[][] x, int sr) {
-            this.x = x;
-            this.sr = sr;
-        }
+    private record ValidationResult(float[][] x, int sr) {
     }
 
     /**
@@ -81,8 +67,8 @@ public class SlieroVadOnnxModel {
         }
 
         // Process the input data when the sample rate is not equal to 16000 and is a multiple of 16000
-        if (sr != 16000 && (sr % 16000 == 0)) {
-            int step = sr / 16000;
+        if (sr != SR16K && (sr % SR16K == 0)) {
+            int step = sr / SR16K;
             float[][] reducedX = new float[x.length][];
 
             for (int i = 0; i < x.length; i++) {
@@ -97,7 +83,7 @@ public class SlieroVadOnnxModel {
             }
 
             x = reducedX;
-            sr = 16000;
+            sr = SR16K;
         }
 
         // If the sample rate is not in the list of supported sample rates, throw an exception
@@ -121,53 +107,41 @@ public class SlieroVadOnnxModel {
         ValidationResult result = validateInput(x, sr);
         x = result.x;
         sr = result.sr;
-
-        int batchSize = x.length;
-
-        if (lastBatchSize == 0 || lastSr != sr || lastBatchSize != batchSize) {
-            resetStates();
-        }
+        float[] xWithContext = Arrays.copyOf(context[0], context[0].length + x[0].length);
+        System.arraycopy(x[0], 0, xWithContext, context[0].length, x[0].length);
+        x[0] = xWithContext;
 
         OrtEnvironment env = OrtEnvironment.getEnvironment();
 
         OnnxTensor inputTensor = null;
-        OnnxTensor hTensor = null;
-        OnnxTensor cTensor = null;
+        OnnxTensor stateTensor = null;
         OnnxTensor srTensor = null;
         OrtSession.Result ortOutputs = null;
 
         try {
             // Create input tensors
             inputTensor = OnnxTensor.createTensor(env, x);
-            hTensor = OnnxTensor.createTensor(env, h);
-            cTensor = OnnxTensor.createTensor(env, c);
+            stateTensor = OnnxTensor.createTensor(env, state);
             srTensor = OnnxTensor.createTensor(env, new long[]{sr});
 
             Map<String, OnnxTensor> inputs = new HashMap<>();
             inputs.put("input", inputTensor);
             inputs.put("sr", srTensor);
-            inputs.put("h", hTensor);
-            inputs.put("c", cTensor);
+            inputs.put("state", stateTensor);
 
             // Call the ONNX model for calculation
             ortOutputs = session.run(inputs);
             // Get the output results
             float[][] output = (float[][]) ortOutputs.get(0).getValue();
-            h = (float[][][]) ortOutputs.get(1).getValue();
-            c = (float[][][]) ortOutputs.get(2).getValue();
-
-            lastSr = sr;
-            lastBatchSize = batchSize;
+            state = (float[][][]) ortOutputs.get(1).getValue();
+            System.arraycopy(x[0], x[0].length-CONTEXT_SIZE-1, context[0], 0, CONTEXT_SIZE);
             return output[0];
         } finally {
             if (inputTensor != null) {
                 inputTensor.close();
             }
-            if (hTensor != null) {
-                hTensor.close();
-            }
-            if (cTensor != null) {
-                cTensor.close();
+            if (stateTensor != null) {
+                stateTensor.close();
             }
             if (srTensor != null) {
                 srTensor.close();
